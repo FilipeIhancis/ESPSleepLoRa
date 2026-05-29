@@ -30,6 +30,10 @@ esp_task_wdt_config_t twdt_config = {
 // Configuração fixa do SPI para ler o LoRa no Wakeup
 SPISettings spiSettings(8E6, MSBFIRST, SPI_MODE0);
 
+RTC_DATA_ATTR bool sleepmode = false;
+bool pacoteRecebido = false;
+int counter = 0;
+
 /*******************************************************************************************/
 void wdt_init()  {
   esp_task_wdt_deinit();
@@ -81,6 +85,49 @@ void initSleep()
   
   delay(50);
   esp_deep_sleep_start();
+}
+
+/******************************************************************************************/
+void IRAM_ATTR aoReceberPacote() {
+  pacoteRecebido = true;
+}
+
+/*******************************************************************************************/
+void configReceiver()
+{
+  attachInterrupt(digitalPinToInterrupt(DIO0), aoReceberPacote, RISING);
+  Serial.println("[LORA] Colocando LoRa em modo de recepção contínua");
+  LoRa.receive();
+}
+
+/********************************************************************************************/
+void checkPacket()
+{
+  esp_task_wdt_reset();
+
+  if (pacoteRecebido)
+  {
+    pacoteRecebido = false; 
+
+    int packetSize = LoRa.parsePacket();
+
+    if (packetSize) 
+    {
+      Serial.print("Received packet '");
+      // read packet
+      while (LoRa.available()) {
+        Serial.print((char)LoRa.read());
+      }
+      // print RSSI of packet
+      Serial.print("' with RSSI ");
+      Serial.println(LoRa.packetRssi());
+      counter++;
+
+    } else {
+      Serial.println("Interrupção disparada, mas nenhum pacote válido extraído.");
+    }
+    LoRa.receive(); 
+  }
 }
 
 /*******************************************************************************************/
@@ -148,10 +195,19 @@ void setup()
     Serial.println("[LORA] Inicializado corretamente");
   }
 
-  initSleep();
+  if(sleepmode) initSleep();
+  else configReceiver();
 }
 
 /*******************************************************************************************/
-void loop() {
+void loop()
+{
   // Loop vazio - Tudo ocorre no ciclo de setup/sleep
+  esp_task_wdt_reset();
+  checkPacket();
+  if(counter > 9) {
+    Serial.println("[SLEEP] Counter > 10, entrando em sleep.");
+    sleepmode = true;
+    initSleep();
+  }
 }
