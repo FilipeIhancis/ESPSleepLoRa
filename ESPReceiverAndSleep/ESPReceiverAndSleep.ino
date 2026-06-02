@@ -1,24 +1,35 @@
 /******************************************************************
 * @brief  Receptor LoRa com ESP32 em sleep
 * @author Filipe Ihancis <@filipeihancist@gmail.com>
-******************************************************************/
+* @attention 
+*/
 
-// Bibliotecas Utilizadas *******
+// Bibliotecas Utilizadas ***************************************************************
 #include <SPI.h>
 #include <LoRa.h>
 #include "esp_task_wdt.h"
 #include "driver/rtc_io.h"
 
-// Pinagem RFM95W ********
-#define SCK     18
-#define MISO    19
-#define MOSI    23
-#define SS      15
-#define RST     2   
-#define DIO0    4   
-#define BAND    915E6 
+// Pinagem RFM95W ************************************************************************
+#define SCK     18        // Serial clock
+#define MISO    19        // Pino master in/slave out
+#define MOSI    23        // Pino Master-out/Slave-in
+#define SS      15        // Pino de chip select/slave select (acorda disp ou seleciona)
+#define RST     2         // Pino de Reset do chip LoRa
+#define DIO0    4         // Pino RxDone (usaremos como interrupção)
+#define BAND    915E6     // Banda de frequência (homologada ANATEL)
 
-// Configurações Watchdog Timer ******************
+
+// Registradores LoRa (checar Datasheet RFM95W) *******************************************
+#define REG_DIO_MAPPING_1           0x40    // Pino RXDONE DIO0
+#define REG_RX_NB_BYTES             0x13    // Número de bytes RX
+#define REG_FIFO_RX_CURRENT_ADDR    0x10    //
+#define REG_FIFO                    0x00    //
+#define REG_PKT_RSSI_VALUE          0x1A    //
+#define REG_FIFO_ADDR_PTR           0x0D    //
+
+
+// Configurações Watchdog Timer ************************************************************
 #define CONFIG_FREERTOS_NUMBER_OF_CORES 1
 #define WDT_TIMEOUT 360000
 esp_task_wdt_config_t twdt_config = {
@@ -27,26 +38,29 @@ esp_task_wdt_config_t twdt_config = {
     .trigger_panic = true,
 };
 
-// Configuração fixa do SPI para ler o LoRa no Wakeup
+// Configuração fixa do SPI para ler o LoRa no Wakeup **************************************
 SPISettings spiSettings(8E6, MSBFIRST, SPI_MODE0);
 
-RTC_DATA_ATTR bool sleepmode = false;
-bool pacoteRecebido = false;
-int counter = 0;
+// Variáveis de controle ********************************************************************
+RTC_DATA_ATTR bool sleepmode  = false;    // Config. Sleep Mode
+bool pacoteRecebido           = false;    // Flag que indica se pacote pode ser recebido
+int counter                   = 0;        // Contador para teste prático
+
 
 /*******************************************************************************************/
 void wdt_init()  {
   esp_task_wdt_deinit();
   esp_task_wdt_init(&twdt_config);
-  esp_task_wdt_add(NULL);
+  esp_task_wdt_add(NULL);           // n tem task especifica de watchdog
 }
 
 /*******************************************************************************************/
-uint8_t readRegRaw(uint8_t reg) {
+uint8_t readRegRaw(uint8_t reg)
+{
   SPI.beginTransaction(spiSettings);
   digitalWrite(SS, LOW);
   SPI.transfer(reg & 0x7F);
-  uint8_t val = SPI.transfer(0x00);
+  uint8_t val = SPI.transfer(REG_FIFO);
   digitalWrite(SS, HIGH);
   SPI.endTransaction();
   return val;
@@ -107,7 +121,7 @@ void checkPacket()
 
   if (pacoteRecebido)
   {
-    pacoteRecebido = false; 
+    pacoteRecebido = false;     // Evitar duplicação
 
     int packetSize = LoRa.parsePacket();
 
@@ -124,54 +138,60 @@ void checkPacket()
       counter++;
 
     } else {
-      Serial.println("Interrupção disparada, mas nenhum pacote válido extraído.");
+      Serial.println("[LORA] Interrupção disparada, mas nenhum pacote válido extraído.");
     }
-    LoRa.receive(); 
+    LoRa.receive();   // coloca em modo de recepção contínua nos registradores
   }
 }
 
 /*******************************************************************************************/
 void setup()
 {
-  // --- A CORREÇÃO DO GLITCH ELÉTRICO ---
-  // 1. Configura os pinos como SAÍDA em nível ALTO (Seguro) PRIMEIRO
+  // Configura os pinos como SAÍDA em nível ALTO
+  // Esse procedimento evita que o registrador seja resetado/limpo devido a pulso RST/SS
   pinMode(SS, OUTPUT);
   digitalWrite(SS, HIGH);
   pinMode(RST, OUTPUT);
   digitalWrite(RST, HIGH);
 
-  // 2. SÓ DEPOIS libera a trava. Isso impede que o RST "caia" pra GND e apague o rádio.
+  // Liberação de trava do sleep. Isso impede que o RST vá pra GND e apague o rádio.
   rtc_gpio_hold_dis((gpio_num_t)SS);
   rtc_gpio_hold_dis((gpio_num_t)RST);
 
+  // Inicialização da Serial
   Serial.begin(115200);
   Serial.println("\n--- LORA RECEIVER WITH DEEP SLEEP ---");
 
-  wdt_init();
+  wdt_init();   // Configuração do watchdog timer (não é crítico, mas padrão aqui)
 
-  // Inicia o SPI do hardware
-  SPI.begin(SCK, MISO, MOSI, SS);
+  SPI.begin(SCK, MISO, MOSI, SS);   // Inicia o SPI dedicado ao LoRa
 
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();    
 
-  // 3. SE ACORDOU, EXTRAI O PACOTE INTACTO
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+  // SE ACORDOU, EXTRAI O PACOTE INTACTO
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0)
+  {
     Serial.println("[WAKE] Acordado. Extraindo dados do buffer de hardware...");
     
     uint8_t irqFlags = readRegRaw(0x12);
     
-    if (irqFlags & 0x40) { // Verifica o bit 0x40 (RxDone)
-      int packetSize = readRegRaw(0x13);
+    // Verifica o bit 0x40 (RxDone) bit a bit
+    if (irqFlags & REG_DIO_MAPPING_1)
+    { 
+      int packetSize = readRegRaw(REG_RX_NB_BYTES); // numero de bytes disponiveis p leitura (rx)
       if (packetSize > 0) {
-        uint8_t rxStartAddr = readRegRaw(0x10);
-        writeRegRaw(0x0D, rxStartAddr);
+        uint8_t rxStartAddr = readRegRaw(REG_FIFO_RX_CURRENT_ADDR);
+        writeRegRaw(REG_FIFO_ADDR_PTR, rxStartAddr);
 
         Serial.print("[LORA] Pacote extraído: '");
         for (int i = 0; i < packetSize; i++) {
-          Serial.print((char)readRegRaw(0x00));
+          Serial.print((char)readRegRaw(REG_FIFO));
         }
-        int rssi = readRegRaw(0x1A) - 157;
+        Serial.println();
+        /*
+        int rssi = readRegRaw(REG_PKT_RSSI_VALUE) - 157;
         Serial.printf("' | RSSI: %d dBm\n", rssi);
+        */
       }
     } else {
       Serial.printf("[AVISO] Acordou, mas sem RxDone. Flags: 0x%02X\n", irqFlags);
@@ -186,8 +206,9 @@ void setup()
   digitalWrite(RST, HIGH);
   delay(1);
 
-  LoRa.setPins(SS, RST, DIO0);
+  LoRa.setPins(SS, RST, DIO0);  // Pinagem LoRa (ind SPI)
 
+  // Inicialização do rádio LoRa
   if (!LoRa.begin(BAND)) {
     Serial.println("[ERRO] Falha crítica ao inicializar o rádio.");
     while (1);
@@ -202,9 +223,10 @@ void setup()
 /*******************************************************************************************/
 void loop()
 {
-  // Loop vazio - Tudo ocorre no ciclo de setup/sleep
   esp_task_wdt_reset();
   checkPacket();
+  
+  // Teste de comutacao para verificar se comportamento será o mesmo (não irá perder pkt etc)
   if(counter > 9) {
     Serial.println("[SLEEP] Counter > 10, entrando em sleep.");
     sleepmode = true;
